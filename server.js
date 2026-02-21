@@ -6,6 +6,7 @@ const fs = require("fs");
 const path = require("path");
 const rateLimit = require("express-rate-limit");
 
+let chatHistory = [];
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -61,18 +62,42 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
 });
 
 // Route: Ask Question
-app.post("/ask", askLimiter, async (req, res) => {
-  const { question } = req.body;
+app.post("/ask", async (req, res) => {
   try {
-    const response = await axios.post("http://localhost:5000/ask", {
-      question,
+    const question = req.body.question;
+
+    // Add user message to history
+    chatHistory.push({
+      role: "user",
+      content: question
     });
 
-    res.json({ answer: response.data.answer });
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ error: "Error answering question" });
+    // Send question + history to FastAPI
+    const response = await axios.post(
+      "http://localhost:5000/ask",
+      {
+        question: question,
+        history: chatHistory
+      }
+    );
+
+    // Add assistant response to history
+    chatHistory.push({
+      role: "assistant",
+      content: response.data.answer
+    });
+
+    res.json(response.data);
+
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Error asking question" });
   }
+});
+
+app.post("/clear-history", (req, res) => {
+  chatHistory = [];
+  res.json({ message: "History cleared" });
 });
 
 app.post("/summarize", summarizeLimiter, async (req, res) => {

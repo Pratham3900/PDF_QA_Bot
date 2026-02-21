@@ -80,8 +80,9 @@ def generate_response(prompt: str, max_new_tokens: int) -> str:
 class PDFPath(BaseModel):
     filePath: str
 
-class Question(BaseModel):
+class AskRequest(BaseModel):
     question: str
+    history: list = []
 
 
 class SummarizeRequest(BaseModel):
@@ -108,24 +109,43 @@ def process_pdf(request: Request, data: PDFPath):
 
 @app.post("/ask")
 @limiter.limit("60/15 minutes")
-def ask_question(request: Request, data: Question):
+def ask_question(request: Request, data: AskRequest):
     global vectorstore, qa_chain
     if not qa_chain:
         return {"answer": "Please upload a PDF first!"}
-
-    docs = vectorstore.similarity_search(data.question, k=4)
+    question = data.question
+    history = data.history
+    conversation_context = ""
+    # Use only last 5 messages to avoid long prompts
+    for msg in history[-5:]:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        conversation_context += f"{role}: {content}\n"
+    docs = vectorstore.similarity_search(question, k=4)
     if not docs:
         return {"answer": "No relevant context found."}
 
     context = "\n\n".join([doc.page_content for doc in docs])
 
-    prompt = (
-        "You are a helpful assistant for question answering over PDF documents. "
-        "Use only the provided context. If the context does not contain the answer, say so briefly.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {data.question}\n"
-        "Answer:"
-    )
+    prompt = f"""
+    You are a helpful assistant answering questions from a PDF document.
+
+    Conversation History:
+    {conversation_context}
+
+    Document Context:
+    {context}
+
+    Current Question:
+    {question}
+
+    Instructions:
+    - Use the document context to answer.
+    - If the answer is not in the document, say so briefly.
+    - Keep the answer concise.
+
+    Answer:
+    """
 
     answer = generate_response(prompt, max_new_tokens=256)
     return {"answer": answer}
