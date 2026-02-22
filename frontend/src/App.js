@@ -62,14 +62,28 @@ function App() {
 
   // Chat per PDF
   const askQuestion = async () => {
-    if (!question.trim() || !selectedPdf) return;
+    if (!selectedPdf) return;
+
+    // Input validation
+    if (!question || !question.trim()) {
+      alert("Question cannot be empty");
+      return;
+    }
+
+    if (question.length > 2000) {
+      alert("Question too long (max 2000 characters)");
+      return;
+    }
+
     setAsking(true);
-    setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "user", text: question }] } : pdf));
+    const trimmedQuestion = question.trim();
+    setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "user", text: trimmedQuestion }] } : pdf));
     try {
-      const res = await axios.post(`${API_BASE}/ask`, { question });
+      const res = await axios.post(`${API_BASE}/ask`, { question: trimmedQuestion });
       setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: res.data.answer }] } : pdf));
     } catch (e) {
-      setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: "Error getting answer." }] } : pdf));
+      const errorMsg = e.response?.data?.error || "Error getting answer.";
+      setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: errorMsg }] } : pdf));
     }
     setQuestion("");
     setAsking(false);
@@ -260,10 +274,10 @@ function App() {
                       <div key={i} className={`d-flex ${msg.role === "user" ? "justify-content-end" : "justify-content-start"} mb-2`}>
                         <div
                           className={`p-2 rounded ${msg.role === "user"
-                              ? "bg-primary text-light"
-                              : darkMode
-                                ? "bg-dark text-light border border-secondary"
-                                : "bg-white text-dark border"
+                            ? "bg-primary text-light"
+                            : darkMode
+                              ? "bg-dark text-light border border-secondary"
+                              : "bg-white text-dark border"
                             }`}
                           style={{ maxWidth: "80%" }}
                         >

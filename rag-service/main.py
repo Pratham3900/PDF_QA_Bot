@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, validator
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -8,7 +8,12 @@ from dotenv import load_dotenv
 import os
 import uvicorn
 import torch
-from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
+)
 
 load_dotenv()
 
@@ -23,7 +28,9 @@ generation_model = None
 generation_is_encoder_decoder = False
 
 # Load local embedding model
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+embedding_model = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
 
 
 def load_generation_model():
@@ -53,7 +60,11 @@ def generate_response(prompt: str, max_new_tokens: int) -> str:
 
     encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
     encoded = {key: value.to(model_device) for key, value in encoded.items()}
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    pad_token_id = (
+        tokenizer.pad_token_id
+        if tokenizer.pad_token_id is not None
+        else tokenizer.eos_token_id
+    )
 
     with torch.no_grad():
         generated_ids = model.generate(
@@ -72,15 +83,24 @@ def generate_response(prompt: str, max_new_tokens: int) -> str:
     text = tokenizer.decode(new_tokens, skip_special_tokens=True)
     return text.strip()
 
+
 class PDFPath(BaseModel):
     filePath: str
 
+
 class Question(BaseModel):
-    question: str
+    question: str = Field(..., min_length=1, max_length=2000)
+
+    @validator("question")
+    def validate_question(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Question cannot be empty or whitespace-only")
+        return v.strip()
 
 
 class SummarizeRequest(BaseModel):
     pdf: str | None = None
+
 
 @app.post("/process-pdf")
 def process_pdf(data: PDFPath):
@@ -92,7 +112,9 @@ def process_pdf(data: PDFPath):
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
     chunks = splitter.split_documents(docs)
     if not chunks:
-            return {"error": "No text chunks generated from the PDF. Please check your file."}
+        return {
+            "error": "No text chunks generated from the PDF. Please check your file."
+        }
     vectorstore = FAISS.from_documents(chunks, embedding_model)
 
     qa_chain = True  # Just a flag to indicate PDF is processed

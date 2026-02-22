@@ -37,9 +37,23 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 // Route: Ask Question
 app.post("/ask", async (req, res) => {
   const { question } = req.body;
+
+  // Input validation
+  if (!question || typeof question !== 'string') {
+    return res.status(400).json({ error: "Question is required and must be a string" });
+  }
+
+  if (!question.trim()) {
+    return res.status(400).json({ error: "Question cannot be empty" });
+  }
+
+  if (question.length > 2000) {
+    return res.status(400).json({ error: "Question too long (max 2000 characters)" });
+  }
+
   try {
     const response = await axios.post("http://localhost:5000/ask", {
-      question,
+      question: question.trim(),
     });
 
     res.json({ answer: response.data.answer });
