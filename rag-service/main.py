@@ -160,6 +160,8 @@ class CompareRequest(BaseModel):
 # -------------------------------------------------------------------
 # SESSION CLEANUP
 # -------------------------------------------------------------------
+
+
 def cleanup_expired_sessions():
     now = time.time()
     expired = [
