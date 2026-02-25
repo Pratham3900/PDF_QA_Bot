@@ -63,34 +63,31 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
 
     const filePath = path.join(__dirname, req.file.path);
 
-    // **CRITICAL**: Clear session and reset backend state before processing new PDF
-    // This prevents cross-document context leakage
+    // Generate or get session ID for this user
+    if (!req.session.sessionId) {
+      const crypto = require("crypto");
+      req.session.sessionId = crypto.randomUUID();
+    }
+
+    // Clear chat history when uploading new PDF
     if (req.session) {
       req.session.chatHistory = [];
-      req.session.currentPdfSessionId = null;
     }
 
-    // Reset backend state through the /reset endpoint
-    try {
-      await axios.post("http://localhost:5000/reset");
-    } catch (resetError) {
-      console.warn("Warning: Could not reset backend state:", resetError.message);
-      // Continue with PDF upload even if reset fails
-    }
-
-    // Send PDF to Python service for processing
-    const uploadResponse = await axios.post("http://localhost:5000/process-pdf", {
-      filePath: filePath,
-    });
-
-    // Store the new PDF session ID for future validation
-    if (uploadResponse.data.session_id && req.session) {
-      req.session.currentPdfSessionId = uploadResponse.data.session_id;
-    }
+    // Send PDF to Python service with session ID in headers
+    const uploadResponse = await axios.post(
+      "http://localhost:5000/process-pdf",
+      { filePath: filePath },
+      {
+        headers: {
+          "X-Session-ID": req.session.sessionId
+        }
+      }
+    );
 
     res.json({
       message: "PDF uploaded & processed successfully!",
-      session_id: uploadResponse.data.session_id,
+      session_id: req.session.sessionId,
       details: uploadResponse.data
     });
   } catch (err) {
@@ -116,12 +113,23 @@ app.post("/ask", askLimiter, async (req, res) => {
       content: question
     });
 
-    // Send question + history to FastAPI
+    // Ensure session ID exists
+    if (!req.session.sessionId) {
+      const crypto = require("crypto");
+      req.session.sessionId = crypto.randomUUID();
+    }
+
+    // Send question to FastAPI with session ID in headers
     const response = await axios.post(
       "http://localhost:5000/ask",
       {
         question: question,
         history: req.session.chatHistory
+      },
+      {
+        headers: {
+          "X-Session-ID": req.session.sessionId
+        }
       }
     );
 
@@ -143,22 +151,31 @@ app.post("/clear-history", (req, res) => {
   // Clear only this user's session history
   if (req.session) {
     req.session.chatHistory = [];
-    req.session.currentPdfSessionId = null;
   }
   res.json({ message: "Chat history cleared" });
 });
 
 app.get("/pdf-status", async (req, res) => {
   try {
+    // Ensure session ID exists
+    if (!req.session.sessionId) {
+      const crypto = require("crypto");
+      req.session.sessionId = crypto.randomUUID();
+    }
+
     // Check backend PDF status
-    const statusResponse = await axios.get("http://localhost:5000/status");
+    const statusResponse = await axios.get("http://localhost:5000/status", {
+      headers: {
+        "X-Session-ID": req.session.sessionId
+      }
+    });
     
     // Include frontend session status
     const frontendStatus = {
       hasSession: !!req.session,
       hasHistory: req.session?.chatHistory?.length > 0 || false,
       historyLength: req.session?.chatHistory?.length || 0,
-      currentSessionId: req.session?.currentPdfSessionId || null
+      sessionId: req.session?.sessionId || null
     };
 
     res.json({
@@ -171,9 +188,52 @@ app.get("/pdf-status", async (req, res) => {
   }
 });
 
+app.post("/compare", async (req, res) => {
+  try {
+    const { question, session_id_1, session_id_2 } = req.body;
+    
+    // Use provided session IDs or current session
+    const id1 = session_id_1 || req.session?.sessionId;
+    const id2 = session_id_2 || req.session?.sessionId;
+    
+    if (!id1 || !id2) {
+      return res.status(400).json({ error: "Session IDs required for comparison" });
+    }
+
+    const response = await axios.post(
+      "http://localhost:5000/compare",
+      {
+        session_id_1: id1,
+        session_id_2: id2,
+        question: question || "Compare these documents"
+      }
+    );
+
+    res.json(response.data);
+  } catch (err) {
+    const details = err.response?.data || err.message;
+    console.error("Comparison failed:", details);
+    res.status(500).json({ error: "Error comparing PDFs", details });
+  }
+});
+
 app.post("/summarize", summarizeLimiter, async (req, res) => {
   try {
-    const response = await axios.post("http://localhost:5000/summarize", req.body || {});
+    // Ensure session ID exists
+    if (!req.session.sessionId) {
+      const crypto = require("crypto");
+      req.session.sessionId = crypto.randomUUID();
+    }
+
+    const response = await axios.post(
+      "http://localhost:5000/summarize",
+      req.body || {},
+      {
+        headers: {
+          "X-Session-ID": req.session.sessionId
+        }
+      }
+    );
     res.json({ summary: response.data.summary });
   } catch (err) {
     const details = err.response?.data || err.message;

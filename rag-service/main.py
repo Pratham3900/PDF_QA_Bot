@@ -13,7 +13,6 @@ import re
 import uvicorn
 from slowapi import Limiter
 from slowapi.util import get_remote_address
-import uuid
 import threading
 from datetime import datetime
 
@@ -39,49 +38,61 @@ if not GROQ_API_KEY:
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ---------------------------------------------------------------------------
-# GLOBAL STATE MANAGEMENT (Thread-safe)
+# GLOBAL STATE MANAGEMENT (Thread-safe, Multi-user support)
 # ---------------------------------------------------------------------------
-# These variables track the current PDF session to prevent context leakage
-vectorstore = None
-qa_chain = False
-current_pdf_session_id = None      # Unique ID for current PDF upload
-current_pdf_upload_time = None     # Timestamp of when PDF was uploaded
-pdf_state_lock = threading.RLock() # Thread-safe access to PDF state
+# Per-user/session storage with proper cleanup and locking
+sessions = {}  # {session_id: {"vectorstore": FAISS, "upload_time": datetime}}
+sessions_lock = threading.RLock()  # Thread-safe access to sessions
 
 # Load local embedding model (unchanged — FAISS retrieval stays the same)
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 
 # ---------------------------------------------------------------------------
-# TEXT NORMALIZATION UTILITIES
+# SESSION MANAGEMENT UTILITIES (Thread-safe, Multi-user support)
 # ---------------------------------------------------------------------------
 
-def clear_vectorstore():
+def get_session_vectorstore(session_id: str):
     """
-    Safely clears the global vectorstore and resets PDF session state.
-    This ensures complete isolation between PDF uploads.
+    Safely retrieves vectorstore for a session.
+    Returns (vectorstore, upload_time) or (None, None) if not found.
     """
-    global vectorstore, qa_chain, current_pdf_session_id, current_pdf_upload_time
-    
-    with pdf_state_lock:
-        # Explicitly set to None to allow garbage collection
-        vectorstore = None
-        qa_chain = False
-        current_pdf_session_id = None
-        current_pdf_upload_time = None
+    with sessions_lock:
+        if session_id in sessions:
+            session_data = sessions[session_id]
+            return session_data.get("vectorstore"), session_data.get("upload_time")
+        return None, None
 
 
-def validate_pdf_session():
+def set_session_vectorstore(session_id: str, vectorstore, upload_time: str):
     """
-    Validates that a PDF is currently loaded.
-    Returns the current session ID if valid, None otherwise.
+    Safely stores vectorstore for a session.
+    Clears old session if it exists (replaces it).
     """
-    global current_pdf_session_id
-    
-    with pdf_state_lock:
-        if not qa_chain or vectorstore is None or current_pdf_session_id is None:
-            return None
-        return current_pdf_session_id
+    with sessions_lock:
+        # Clear old session to prevent memory leaks
+        if session_id in sessions:
+            old_vectorstore = sessions[session_id].get("vectorstore")
+            if old_vectorstore is not None:
+                del old_vectorstore  # Allow garbage collection
+        
+        # Store new session
+        sessions[session_id] = {
+            "vectorstore": vectorstore,
+            "upload_time": upload_time
+        }
+
+
+def clear_session(session_id: str):
+    """
+    Safely clears a specific session's vectorstore and data.
+    """
+    with sessions_lock:
+        if session_id in sessions:
+            old_vectorstore = sessions[session_id].get("vectorstore")
+            if old_vectorstore is not None:
+                del old_vectorstore  # Allow garbage collection
+            del sessions[session_id]
 
 
 def normalize_spaced_text(text: str) -> str:
@@ -167,52 +178,44 @@ class SummarizeRequest(BaseModel):
 @app.post("/process-pdf")
 @limiter.limit("15/15 minutes")
 def process_pdf(request: Request, data: PDFPath):
-    global vectorstore, qa_chain, current_pdf_session_id, current_pdf_upload_time
-    
+    """
+    Process and store PDF with proper cleanup and thread-safe multi-user support.
+    """
     try:
-        with pdf_state_lock:
-            # **CRITICAL**: Clear old vectorstore and session before processing new PDF
-            # This is the primary fix for cross-document context leakage
-            clear_vectorstore()
-            
-            # Create a new unique session ID for this PDF upload
-            current_pdf_session_id = str(uuid.uuid4())
-            current_pdf_upload_time = datetime.now().isoformat()
-            
-            loader = PyPDFLoader(data.filePath)
-            raw_docs = loader.load()
+        loader = PyPDFLoader(data.filePath)
+        raw_docs = loader.load()
 
-            if not raw_docs:
-                clear_vectorstore()
-                return {"error": "PDF file is empty or unreadable. Please upload a valid PDF."}
+        if not raw_docs:
+            return {"error": "PDF file is empty or unreadable. Please check your file."}
 
-            # ── Layer 1: normalize at ingestion ──────────────────────────────────────
-            # Clean each page's text before chunking so embeddings are on real words.
-            cleaned_docs = []
-            for doc in raw_docs:
-                cleaned_content = normalize_spaced_text(doc.page_content)
-                cleaned_docs.append(Document(page_content=cleaned_content, metadata=doc.metadata))
+        # ── Layer 1: normalize at ingestion ──────────────────────────────────────
+        cleaned_docs = []
+        for doc in raw_docs:
+            cleaned_content = normalize_spaced_text(doc.page_content)
+            cleaned_docs.append(Document(page_content=cleaned_content, metadata=doc.metadata))
 
-            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-            chunks = splitter.split_documents(cleaned_docs)
-            
-            if not chunks:
-                clear_vectorstore()
-                return {"error": "No text chunks generated from the PDF. Please check your file."}
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+        chunks = splitter.split_documents(cleaned_docs)
+        
+        if not chunks:
+            return {"error": "No text chunks generated from the PDF. Please check your file."}
 
-            # Create fresh vectorstore with only current PDF embeddings
-            vectorstore = FAISS.from_documents(chunks, embedding_model)
-            qa_chain = True
-            
-            return {
-                "message": "PDF processed successfully",
-                "session_id": current_pdf_session_id,
-                "upload_time": current_pdf_upload_time,
-                "chunks_created": len(chunks)
-            }
+        # **KEY FIX**: Store per-session with automatic cleanup of old data
+        session_id = request.headers.get("X-Session-ID", "default")
+        upload_time = datetime.now().isoformat()
+        
+        # Thread-safe storage (automatically clears old session data)
+        vectorstore = FAISS.from_documents(chunks, embedding_model)
+        set_session_vectorstore(session_id, vectorstore, upload_time)
+        
+        return {
+            "message": "PDF processed successfully",
+            "session_id": session_id,
+            "upload_time": upload_time,
+            "chunks_created": len(chunks)
+        }
             
     except Exception as e:
-        clear_vectorstore()
         return {
             "error": f"PDF processing failed: {str(e)}",
             "details": "Please ensure the file is a valid PDF"
@@ -222,25 +225,22 @@ def process_pdf(request: Request, data: PDFPath):
 @app.post("/ask")
 @limiter.limit("60/15 minutes")
 def ask_question(request: Request, data: AskRequest):
-    global vectorstore, qa_chain
+    """
+    Answer questions using session-specific PDF context with thread-safe access.
+    """
+    session_id = request.headers.get("X-Session-ID", "default")
+    vectorstore, upload_time = get_session_vectorstore(session_id)
     
-    # **CRITICAL VALIDATION**: Ensure PDF is loaded and session is valid
-    current_session = validate_pdf_session()
-    if not current_session or not vectorstore or not qa_chain:
+    if vectorstore is None:
         return {"answer": "Please upload a PDF first!"}
     
     try:
-        with pdf_state_lock:
-            # Validate vectorstore still exists (safety check for concurrent requests)
-            if vectorstore is None:
-                return {"answer": "PDF session expired or cleared. Please upload a new PDF."}
-            
+        # Thread-safe vectorstore access
+        with sessions_lock:
             question = data.question
             history = data.history
             conversation_context = ""
             
-            # Use only last 5 messages to avoid long prompts and context leakage
-            # NEW: More defensive filtering of history
             if history:
                 for msg in history[-5:]:
                     role = msg.get("role", "")
@@ -248,11 +248,11 @@ def ask_question(request: Request, data: AskRequest):
                     if role and content:
                         conversation_context += f"{role}: {content}\n"
             
+            # Search only within current session's vectorstore
             docs = vectorstore.similarity_search(question, k=4)
             if not docs:
                 return {"answer": "No relevant context found in the current PDF."}
 
-            # ── Layer 2a: context is already clean (normalized at ingestion) ──────────
             context = "\n\n".join([doc.page_content for doc in docs])
 
             prompt = f"""You are a helpful assistant answering questions ONLY from the provided PDF document.
@@ -260,7 +260,7 @@ def ask_question(request: Request, data: AskRequest):
 Conversation History (for context only):
 {conversation_context}
 
-Document Context (ONLY reference this, NOT previous PDFs):
+Document Context (ONLY reference this):
 {context}
 
 Current Question:
@@ -271,13 +271,10 @@ Instructions:
 - Do NOT use any information from previous documents or conversations outside this context.
 - If the answer is not in the document, say so briefly.
 - Keep the answer concise (2-3 sentences max).
-- Do NOT mention previous PDFs or unrelated documents.
 
 Answer:"""
 
             raw_answer = generate_response(prompt, max_new_tokens=512)
-
-            # ── Layer 3: post-process the answer itself ────────────────────────────────
             answer = normalize_answer(raw_answer)
             return {"answer": answer}
             
@@ -288,24 +285,22 @@ Answer:"""
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
 def summarize_pdf(request: Request, data: SummarizeRequest):
-    global vectorstore, qa_chain
+    """
+    Summarize PDF using session-specific context with thread-safe access.
+    """
+    session_id = request.headers.get("X-Session-ID", "default")
+    vectorstore, upload_time = get_session_vectorstore(session_id)
     
-    # **CRITICAL VALIDATION**: Ensure PDF is loaded and session is valid
-    current_session = validate_pdf_session()
-    if not current_session or not vectorstore or not qa_chain:
+    if vectorstore is None:
         return {"summary": "Please upload a PDF first!"}
 
     try:
-        with pdf_state_lock:
-            # Validate vectorstore still exists (safety check for concurrent requests)
-            if vectorstore is None:
-                return {"summary": "PDF session expired or cleared. Please upload a new PDF."}
-
+        # Thread-safe vectorstore access
+        with sessions_lock:
             docs = vectorstore.similarity_search("Give a concise summary of the document.", k=6)
             if not docs:
                 return {"summary": "No document context available to summarize."}
 
-            # Context is already clean (normalized at ingestion)
             context = "\n\n".join([doc.page_content for doc in docs])
 
             prompt = (
@@ -329,22 +324,67 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
         return {"summary": f"Error summarizing PDF: {str(e)}"}
 
 
+@app.post("/compare")
+@limiter.limit("15/15 minutes")
+def compare_pdfs(request: Request, data: dict):
+    """
+    Compare two PDFs using their session-specific contexts.
+    Supports multi-user/multi-PDF comparison feature.
+    """
+    session_id_1 = data.get("session_id_1", "default")
+    session_id_2 = data.get("session_id_2", "default")
+    question = data.get("question", "Compare these documents")
+    
+    vectorstore_1, _ = get_session_vectorstore(session_id_1)
+    vectorstore_2, _ = get_session_vectorstore(session_id_2)
+    
+    if vectorstore_1 is None or vectorstore_2 is None:
+        return {"error": "One or both sessions do not have a PDF loaded"}
+    
+    try:
+        with sessions_lock:
+            docs_1 = vectorstore_1.similarity_search(question, k=3)
+            docs_2 = vectorstore_2.similarity_search(question, k=3)
+            
+            context_1 = "\n\n".join([doc.page_content for doc in docs_1])
+            context_2 = "\n\n".join([doc.page_content for doc in docs_2])
+            
+            prompt = f"""You are a document comparison assistant.
+
+PDF 1 Context:
+{context_1}
+
+PDF 2 Context:
+{context_2}
+
+Question: {question}
+
+Compare the two documents regarding this question and highlight key differences and similarities.
+
+Comparison:"""
+            
+            comparison = generate_response(prompt, max_new_tokens=512)
+            return {"comparison": normalize_answer(comparison)}
+            
+    except Exception as e:
+        return {"error": f"Error comparing PDFs: {str(e)}"}
+
+
 @app.post("/reset")
 @limiter.limit("60/15 minutes")
 def reset_session(request: Request):
     """
-    Explicitly resets all PDF state and clears the vectorstore.
-    Should be called by frontend when uploading a new PDF.
+    Explicitly resets a session by clearing its vectorstore.
     """
-    global vectorstore, qa_chain, current_pdf_session_id, current_pdf_upload_time
+    session_id = request.headers.get("X-Session-ID", "default")
     
-    with pdf_state_lock:
-        old_session = current_pdf_session_id
-        clear_vectorstore()
-        return {
-            "message": "Session cleared successfully",
-            "cleared_session_id": old_session
-        }
+    with sessions_lock:
+        clear_session(session_id)
+        
+    return {
+        "message": "Session cleared successfully",
+        "session_id": session_id
+    }
 
 
 @app.get("/status")
@@ -353,13 +393,19 @@ def get_pdf_status(request: Request):
     Returns the current PDF session status.
     Useful for debugging and ensuring proper state management.
     """
-    global current_pdf_session_id, current_pdf_upload_time, qa_chain
+    session_id = request.headers.get("X-Session-ID", "default")
     
-    with pdf_state_lock:
+    with sessions_lock:
+        if session_id in sessions:
+            return {
+                "pdf_loaded": True,
+                "session_id": session_id,
+                "upload_time": sessions[session_id].get("upload_time")
+            }
         return {
-            "pdf_loaded": qa_chain,
-            "session_id": current_pdf_session_id,
-            "upload_time": current_pdf_upload_time
+            "pdf_loaded": False,
+            "session_id": session_id,
+            "upload_time": None
         }
 
 
