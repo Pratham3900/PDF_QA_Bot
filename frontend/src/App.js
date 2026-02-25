@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from "react";
 import axios from "axios";
 import ReactMarkdown from "react-markdown";
-import { Document, Page, pdfjs } from "react-pdf";
 import "bootstrap/dist/css/bootstrap.min.css";
 import {
   Container,
@@ -193,9 +192,11 @@ function App() {
     if (selectedDocs.length === 0) return;
     setSummarizing(true);
     try {
+      // Use the first selected document's sessionId
       const res = await axios.post(`${API_BASE}/summarize`, {
         doc_ids: selectedDocs,
       });
+
       setChatHistory((prev) => [
         ...prev,
         { role: "bot", text: res.data.summary },
